@@ -1,6 +1,8 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Collection, REST, Routes } = require('discord.js');
 const { Player, QueryType } = require('discord-player');
+const { YoutubeiExtractor } = require("discord-player-youtubei");
+const playdl = require("play-dl");
 
 const client = new Client({
     intents: [
@@ -20,9 +22,16 @@ const player = new Player(client, {
     }
 });
 
+// Registramos el extractor moderno para YouTube (Android client bypass)
+player.extractors.register(YoutubeiExtractor, {
+    streamOptions: {
+        useClient: "ANDROID"
+    }
+});
+
 const { DefaultExtractors } = require('@discord-player/extractor');
 
-// Cargamos los extractores por defecto (YouTube, Spotify, SoundCloud, etc.)
+// Cargamos los extractores por defecto (Spotify, SoundCloud, etc.)
 player.extractors.loadMulti(DefaultExtractors);
 
 // Inactividad de 30 minutos (1800000 ms)
@@ -77,12 +86,14 @@ const commands = [
                 type: 3,
                 description: 'Nombre del artista',
                 required: true,
+                autocomplete: true,
             },
             {
                 name: 'cancion',
                 type: 3,
                 description: 'Nombre de la canción',
                 required: true,
+                autocomplete: true,
             },
         ],
     },
@@ -109,11 +120,41 @@ client.once('ready', async () => {
 });
 
 client.on('interactionCreate', async (interaction) => {
+    if (interaction.isAutocomplete()) {
+        const commandName = interaction.commandName;
+        
+        if (commandName === 'plays') {
+            const focusedValue = interaction.options.getFocused();
+            if (!focusedValue) return await interaction.respond([]);
+
+            try {
+                // Buscamos en YouTube o YT Music usando play-dl para sugerencias rápidas
+                const results = await playdl.search(focusedValue, { limit: 15, source: { youtube: 'video' } });
+                
+                // Filtramos y mapeamos resultados para Discord (máximo 25 opciones, max 100 caracteres por nombre)
+                const choices = results.map(video => {
+                    // Truncamos el título si es muy largo
+                    const title = video.title.length > 95 ? video.title.substring(0, 95) + '...' : video.title;
+                    return {
+                        name: title,
+                        value: title 
+                    };
+                }).slice(0, 10); // Mostramos solo los 10 mejores para no saturar
+
+                await interaction.respond(choices);
+            } catch (error) {
+                console.error("Autocomplete error:", error);
+                await interaction.respond([]);
+            }
+        }
+        return;
+    }
+
     if (!interaction.isChatInputCommand()) return;
 
     if (interaction.commandName === 'help') {
         return interaction.reply({
-            content: `🎭 **¡Hola! Soy Jester, tu bufón musical.**\n\nMis comandos actuales:\n- \`/playy <url>\`: Reproduce una canción directamente desde un enlace de YouTube.\n- \`/plays <artista> <cancion>\`: Busca y reproduce una canción usando Spotify.\n- \`/help\`: Muestra este mensaje de ayuda.\n\n🎵 *Si me quedo solo o sin música durante 30 minutos, me iré a descansar.*`,
+            content: `🎭 **¡Hola! Soy Jester, tu bufón musical.**\n\nMis comandos actuales:\n- \`/playy <url>\`: Reproduce una canción directamente desde un enlace de YouTube.\n- \`/plays <artista> <cancion>\`: Busca y reproduce una canción (ahora con autocompletado en vivo).\n- \`/help\`: Muestra este mensaje de ayuda.\n\n🎵 *Si me quedo solo o sin música durante 30 minutos, me iré a descansar.*`,
             ephemeral: true
         });
     }
@@ -131,18 +172,32 @@ client.on('interactionCreate', async (interaction) => {
 
         await interaction.deferReply();
 
-            let query = '';
+        let queryUrl = '';
         if (interaction.commandName === 'playy') {
-            query = interaction.options.getString('url');
+            queryUrl = interaction.options.getString('url');
         } else if (interaction.commandName === 'plays') {
             const artista = interaction.options.getString('artista');
             const cancion = interaction.options.getString('cancion');
-            query = `${artista} ${cancion}`;
+            const searchString = `${artista} ${cancion}`;
+            
+            // Usamos play-dl como puente robusto para encontrar el link de YouTube de la canción
+            try {
+                const ytResults = await playdl.search(searchString, { limit: 1, source: { youtube: 'video' } });
+                if (ytResults && ytResults.length > 0) {
+                    queryUrl = ytResults[0].url;
+                } else {
+                    return interaction.followUp('❌ No se encontró el audio para esa canción.');
+                }
+            } catch(e) {
+                console.error(e);
+                return interaction.followUp('❌ Hubo un error buscando en el catálogo musical.');
+            }
         }
         
         try {
-            const searchResult = await player.search(query, {
-                searchEngine: QueryType.AUTO,
+            // Buscamos con discord-player usando la URL de youtube obtenida (o dada por el user en playy)
+            const searchResult = await player.search(queryUrl, {
+                searchEngine: QueryType.YOUTUBE_VIDEO,
                 requestedBy: interaction.user
             });
 
