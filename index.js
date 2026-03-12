@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Collection, REST, Routes } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
+const ytdlExec = require('youtube-dl-exec');
 const playdl = require('play-dl');
 const https = require('https');
 
@@ -57,6 +58,30 @@ function searchDeezer(endpoint, query) {
     });
 }
 
+// Obtener info de un vídeo de YouTube usando yt-dlp
+async function getYouTubeInfo(url) {
+    const result = await ytdlExec(url, {
+        dumpSingleJson: true,
+        noCheckCertificates: true,
+        noWarnings: true,
+        preferFreeFormats: true,
+        format: 'bestaudio[ext=webm]/bestaudio/best',
+    });
+    return { title: result.title, url: result.webpage_url || url };
+}
+
+// Crear un stream de audio usando yt-dlp (subproceso que escribe al stdout)
+function createYtDlpStream(url) {
+    const subprocess = ytdlExec.exec(url, {
+        output: '-',
+        format: 'bestaudio[ext=webm]/bestaudio/best',
+        noCheckCertificates: true,
+        noWarnings: true,
+        quiet: true,
+    });
+    return subprocess;
+}
+
 // Reproduce la siguiente canción de la cola
 async function playNext(guildId, textChannel) {
     const serverQueue = queues.get(guildId);
@@ -69,13 +94,29 @@ async function playNext(guildId, textChannel) {
     const song = serverQueue.songs[0];
 
     try {
-        const stream = await playdl.stream(song.url);
-        const resource = createAudioResource(stream.stream, {
-            inputType: stream.type
+        // Usamos yt-dlp para hacer pipe del audio
+        const subprocess = createYtDlpStream(song.url);
+        const stream = subprocess.stdout;
+
+        if (!stream) {
+            throw new Error('No se pudo obtener el stream de audio');
+        }
+
+        // Guardamos referencia al subproceso para poder matarlo si es necesario
+        serverQueue.currentSubprocess = subprocess;
+
+        const resource = createAudioResource(stream, {
+            inputType: undefined, // Let discord.js auto-detect
         });
 
         serverQueue.player.play(resource);
         textChannel.send(`🎶 Reproduciendo ahora: **${song.title}**`);
+
+        // Si el subproceso falla, lo manejamos
+        subprocess.on('error', (err) => {
+            console.error('yt-dlp subprocess error:', err);
+        });
+
     } catch (error) {
         console.error('Error reproduciendo:', error);
         textChannel.send('❌ Error al reproducir la canción, saltando...');
@@ -186,13 +227,10 @@ client.on('interactionCreate', async (interaction) => {
                     artista ? track.artist.name.toLowerCase().includes(artista.toLowerCase()) : true
                 );
 
-                const choices = filtered.map(track => {
-                    const label = `${track.title}`;
-                    return {
-                        name: label.length > 95 ? label.substring(0, 95) + '...' : label,
-                        value: track.title
-                    };
-                }).slice(0, 10);
+                const choices = filtered.map(track => ({
+                    name: track.title.length > 95 ? track.title.substring(0, 95) + '...' : track.title,
+                    value: track.title
+                })).slice(0, 10);
                 await interaction.respond(choices);
             }
         } catch (error) {
@@ -219,6 +257,10 @@ client.on('interactionCreate', async (interaction) => {
         if (!serverQueue || serverQueue.songs.length === 0) {
             return interaction.reply({ content: '❌ No hay nada reproduciéndose.', ephemeral: true });
         }
+        // Matar el subproceso actual de yt-dlp si existe
+        if (serverQueue.currentSubprocess) {
+            serverQueue.currentSubprocess.kill();
+        }
         serverQueue.songs.shift();
         serverQueue.player.stop();
         return interaction.reply('⏭️ Canción saltada.');
@@ -229,6 +271,9 @@ client.on('interactionCreate', async (interaction) => {
         const serverQueue = queues.get(interaction.guild.id);
         if (!serverQueue) {
             return interaction.reply({ content: '❌ No hay nada reproduciéndose.', ephemeral: true });
+        }
+        if (serverQueue.currentSubprocess) {
+            serverQueue.currentSubprocess.kill();
         }
         serverQueue.songs = [];
         serverQueue.player.stop();
@@ -260,21 +305,17 @@ client.on('interactionCreate', async (interaction) => {
                 // YouTube: el usuario pasa directamente un enlace
                 videoUrl = interaction.options.getString('url');
 
-                // Validamos que sea un enlace de YouTube
-                if (!playdl.yt_validate(videoUrl)) {
-                    return interaction.followUp('❌ Eso no parece ser un enlace válido de YouTube. Usa un enlace como `https://www.youtube.com/watch?v=...` o `https://youtu.be/...`');
-                }
-
-                // Obtenemos el título del vídeo
-                const info = await playdl.video_basic_info(videoUrl);
-                videoTitle = info.video_details.title;
+                // Obtenemos el título del vídeo con yt-dlp
+                const info = await getYouTubeInfo(videoUrl);
+                videoTitle = info.title;
 
             } else if (interaction.commandName === 'plays') {
-                // Spotify/Artista: buscamos en YouTube la canción del artista
+                // Buscar la canción del artista en YouTube
                 const artista = interaction.options.getString('artista');
                 const cancion = interaction.options.getString('cancion');
                 const searchString = `${artista} - ${cancion}`;
 
+                // Usamos play-dl solo para buscar (no para streaming)
                 const results = await playdl.search(searchString, { limit: 1, source: { youtube: 'video' } });
                 if (!results || results.length === 0) {
                     return interaction.followUp('❌ No se encontró ninguna canción con ese nombre y artista.');
@@ -312,6 +353,7 @@ client.on('interactionCreate', async (interaction) => {
             player,
             songs: [song],
             textChannel: interaction.channel,
+            currentSubprocess: null,
         };
 
         queues.set(interaction.guild.id, newQueue);
