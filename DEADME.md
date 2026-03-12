@@ -1,4 +1,4 @@
-# discord-bot
+# Discord-bot
 A simple Discord Bot made with Vibe Coding
 
 # Guía de Despliegue - Discord Bot
