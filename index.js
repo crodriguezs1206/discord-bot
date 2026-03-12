@@ -90,8 +90,7 @@ const YT_DLP_BASE_ARGS = [
     '--no-warnings',
     '--no-cache-dir',
     '--geo-bypass',
-    '--extractor-args', 'youtube:player_client=android',
-    '--user-agent', 'Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    '--extractor-args', 'youtube:player_client=tv_embedded',
 ];
 
 // Ejecutar yt-dlp
@@ -171,7 +170,7 @@ function searchDeezer(endpoint, query) {
 // Obtener título de un vídeo
 async function getVideoTitle(videoUrl) {
     const output = await ytDlpExec(videoUrl, [
-        '--dump-json', '--skip-download', '-f', 'bestaudio'
+        '--dump-json', '--skip-download', '-f', 'bestaudio/best'
     ]);
     const json = JSON.parse(output);
     return json.title;
@@ -180,7 +179,7 @@ async function getVideoTitle(videoUrl) {
 // Obtener URL directa de audio
 async function getDirectAudioUrl(videoUrl) {
     const output = await ytDlpExec(videoUrl, [
-        '--get-url', '-f', 'bestaudio'
+        '--get-url', '-f', 'bestaudio/best'
     ]);
     return output.trim();
 }
