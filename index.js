@@ -1,9 +1,11 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Collection, REST, Routes } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, StreamType } = require('@discordjs/voice');
 const ytdlExec = require('youtube-dl-exec');
 const playdl = require('play-dl');
 const https = require('https');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 
 const client = new Client({
     intents: [
@@ -58,28 +60,49 @@ function searchDeezer(endpoint, query) {
     });
 }
 
-// Obtener info de un vídeo de YouTube usando yt-dlp
-async function getYouTubeInfo(url) {
-    const result = await ytdlExec(url, {
+// Obtener la URL directa de audio de un vídeo de YouTube usando yt-dlp
+async function getDirectAudioUrl(videoUrl) {
+    const result = await ytdlExec(videoUrl, {
+        getUrl: true,
+        format: 'bestaudio',
+        noCheckCertificates: true,
+        noWarnings: true,
+    });
+    return result.trim();
+}
+
+// Obtener info (título) de un vídeo de YouTube
+async function getVideoTitle(videoUrl) {
+    const result = await ytdlExec(videoUrl, {
         dumpSingleJson: true,
         noCheckCertificates: true,
         noWarnings: true,
-        preferFreeFormats: true,
-        format: 'bestaudio[ext=webm]/bestaudio/best',
+        skipDownload: true,
+        format: 'bestaudio',
     });
-    return { title: result.title, url: result.webpage_url || url };
+    return result.title;
 }
 
-// Crear un stream de audio usando yt-dlp (subproceso que escribe al stdout)
-function createYtDlpStream(url) {
-    const subprocess = ytdlExec.exec(url, {
-        output: '-',
-        format: 'bestaudio[ext=webm]/bestaudio/best',
-        noCheckCertificates: true,
-        noWarnings: true,
-        quiet: true,
+// Crear un stream de audio PCM a partir de una URL directa usando ffmpeg
+function createFfmpegStream(directUrl) {
+    const ffmpeg = spawn(ffmpegPath, [
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',
+        '-i', directUrl,
+        '-analyzeduration', '0',
+        '-loglevel', '0',
+        '-f', 's16le',      // raw PCM
+        '-ar', '48000',     // 48kHz (Discord standard)
+        '-ac', '2',         // stereo
+        'pipe:1'
+    ]);
+
+    ffmpeg.stderr.on('data', (d) => {
+        // Silenciar logs de ffmpeg
     });
-    return subprocess;
+
+    return ffmpeg;
 }
 
 // Reproduce la siguiente canción de la cola
@@ -94,27 +117,22 @@ async function playNext(guildId, textChannel) {
     const song = serverQueue.songs[0];
 
     try {
-        // Usamos yt-dlp para hacer pipe del audio
-        const subprocess = createYtDlpStream(song.url);
-        const stream = subprocess.stdout;
+        // Paso 1: Obtener la URL directa del audio con yt-dlp
+        const directUrl = await getDirectAudioUrl(song.url);
 
-        if (!stream) {
-            throw new Error('No se pudo obtener el stream de audio');
-        }
+        // Paso 2: Transcodificar con ffmpeg a PCM raw
+        const ffmpeg = createFfmpegStream(directUrl);
+        serverQueue.currentProcess = ffmpeg;
 
-        // Guardamos referencia al subproceso para poder matarlo si es necesario
-        serverQueue.currentSubprocess = subprocess;
-
-        const resource = createAudioResource(stream, {
-            inputType: undefined, // Let discord.js auto-detect
+        const resource = createAudioResource(ffmpeg.stdout, {
+            inputType: StreamType.Raw,
         });
 
         serverQueue.player.play(resource);
         textChannel.send(`🎶 Reproduciendo ahora: **${song.title}**`);
 
-        // Si el subproceso falla, lo manejamos
-        subprocess.on('error', (err) => {
-            console.error('yt-dlp subprocess error:', err);
+        ffmpeg.on('error', (err) => {
+            console.error('ffmpeg error:', err);
         });
 
     } catch (error) {
@@ -222,7 +240,7 @@ client.on('interactionCreate', async (interaction) => {
                     : focusedValue;
 
                 const result = await searchDeezer('track', searchQuery);
-                // Filtramos: solo canciones cuyo artista coincida (case-insensitive)
+                // Solo canciones cuyo artista coincida
                 const filtered = (result.data || []).filter(track =>
                     artista ? track.artist.name.toLowerCase().includes(artista.toLowerCase()) : true
                 );
@@ -257,9 +275,8 @@ client.on('interactionCreate', async (interaction) => {
         if (!serverQueue || serverQueue.songs.length === 0) {
             return interaction.reply({ content: '❌ No hay nada reproduciéndose.', ephemeral: true });
         }
-        // Matar el subproceso actual de yt-dlp si existe
-        if (serverQueue.currentSubprocess) {
-            serverQueue.currentSubprocess.kill();
+        if (serverQueue.currentProcess) {
+            serverQueue.currentProcess.kill();
         }
         serverQueue.songs.shift();
         serverQueue.player.stop();
@@ -272,8 +289,8 @@ client.on('interactionCreate', async (interaction) => {
         if (!serverQueue) {
             return interaction.reply({ content: '❌ No hay nada reproduciéndose.', ephemeral: true });
         }
-        if (serverQueue.currentSubprocess) {
-            serverQueue.currentSubprocess.kill();
+        if (serverQueue.currentProcess) {
+            serverQueue.currentProcess.kill();
         }
         serverQueue.songs = [];
         serverQueue.player.stop();
@@ -304,18 +321,14 @@ client.on('interactionCreate', async (interaction) => {
             if (interaction.commandName === 'playy') {
                 // YouTube: el usuario pasa directamente un enlace
                 videoUrl = interaction.options.getString('url');
-
-                // Obtenemos el título del vídeo con yt-dlp
-                const info = await getYouTubeInfo(videoUrl);
-                videoTitle = info.title;
+                videoTitle = await getVideoTitle(videoUrl);
 
             } else if (interaction.commandName === 'plays') {
-                // Buscar la canción del artista en YouTube
+                // Buscar la canción del artista en YouTube vía play-dl
                 const artista = interaction.options.getString('artista');
                 const cancion = interaction.options.getString('cancion');
                 const searchString = `${artista} - ${cancion}`;
 
-                // Usamos play-dl solo para buscar (no para streaming)
                 const results = await playdl.search(searchString, { limit: 1, source: { youtube: 'video' } });
                 if (!results || results.length === 0) {
                     return interaction.followUp('❌ No se encontró ninguna canción con ese nombre y artista.');
@@ -326,7 +339,7 @@ client.on('interactionCreate', async (interaction) => {
             }
         } catch (error) {
             console.error('Error buscando:', error);
-            return interaction.followUp('❌ Hubo un error buscando la canción.');
+            return interaction.followUp('❌ Hubo un error buscando la canción. Comprueba que el enlace es válido.');
         }
 
         // Añadir a la cola y reproducir
@@ -336,7 +349,7 @@ client.on('interactionCreate', async (interaction) => {
         if (serverQueue) {
             // Ya hay una cola activa, añadimos la canción
             serverQueue.songs.push(song);
-            return interaction.followUp(`✅ Añadido a la cola: **${videoTitle}**`);
+            return interaction.followUp(`✅ Añadido a la cola (#${serverQueue.songs.length}): **${videoTitle}**`);
         }
 
         // Crear nueva cola y conectar al canal de voz
@@ -353,7 +366,7 @@ client.on('interactionCreate', async (interaction) => {
             player,
             songs: [song],
             textChannel: interaction.channel,
-            currentSubprocess: null,
+            currentProcess: null,
         };
 
         queues.set(interaction.guild.id, newQueue);
@@ -364,7 +377,11 @@ client.on('interactionCreate', async (interaction) => {
             const q = queues.get(interaction.guild.id);
             if (q) {
                 q.songs.shift();
-                playNext(interaction.guild.id, q.textChannel);
+                if (q.songs.length > 0) {
+                    playNext(interaction.guild.id, q.textChannel);
+                } else {
+                    startInactivityTimer(interaction.guild.id);
+                }
             }
         });
 
@@ -372,7 +389,7 @@ client.on('interactionCreate', async (interaction) => {
             console.error('Player error:', error);
             const q = queues.get(interaction.guild.id);
             if (q) {
-                q.textChannel.send('❌ Error en la reproducción.');
+                q.textChannel.send('❌ Error en la reproducción, saltando...');
                 q.songs.shift();
                 playNext(interaction.guild.id, q.textChannel);
             }
@@ -380,6 +397,8 @@ client.on('interactionCreate', async (interaction) => {
 
         // Limpiar cuando se desconecta
         connection.on(VoiceConnectionStatus.Disconnected, () => {
+            const q = queues.get(interaction.guild.id);
+            if (q && q.currentProcess) q.currentProcess.kill();
             queues.delete(interaction.guild.id);
             clearInactivityTimer(interaction.guild.id);
         });
