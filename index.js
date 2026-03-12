@@ -1,8 +1,8 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Collection, REST, Routes } = require('discord.js');
-const { Player, QueryType } = require('discord-player');
-const { YoutubeiExtractor } = require("discord-player-youtubei");
-const playdl = require("play-dl");
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
+const playdl = require('play-dl');
+const https = require('https');
 
 const client = new Client({
     intents: [
@@ -14,72 +14,93 @@ const client = new Client({
 
 client.commands = new Collection();
 
-// Inicializamos el reproductor
-const player = new Player(client, {
-    ytdlOptions: {
-        quality: 'highestaudio',
-        highWaterMark: 1 << 25
-    }
-});
+// Cola de reproducción por servidor
+const queues = new Map();
 
-// Registramos el extractor moderno para YouTube (Android client bypass)
-player.extractors.register(YoutubeiExtractor, {
-    streamOptions: {
-        useClient: "ANDROID"
-    }
-});
-
-const { DefaultExtractors } = require('@discord-player/extractor');
-
-// Cargamos los extractores por defecto (Spotify, SoundCloud, etc.)
-player.extractors.loadMulti(DefaultExtractors);
-
-// Inactividad de 30 minutos (1800000 ms)
+// Inactividad de 30 minutos
 const INACTIVITY_TIMEOUT = 1800 * 1000;
 const disconnectTimers = new Map();
 
-player.events.on('emptyChannel', (queue) => {
-    // Cuando el canal de voz se queda vacío
-    const timer = setTimeout(() => {
-        if (queue.connection) queue.delete();
-    }, INACTIVITY_TIMEOUT);
-    disconnectTimers.set(queue.guild.id, timer);
-});
+// --- Funciones auxiliares ---
 
-player.events.on('emptyQueue', (queue) => {
-    // Cuando se acaba la música
+function startInactivityTimer(guildId) {
+    clearInactivityTimer(guildId);
     const timer = setTimeout(() => {
-        if (queue.connection) queue.delete();
+        const serverQueue = queues.get(guildId);
+        if (serverQueue) {
+            serverQueue.connection.destroy();
+            queues.delete(guildId);
+        }
     }, INACTIVITY_TIMEOUT);
-    disconnectTimers.set(queue.guild.id, timer);
-});
+    disconnectTimers.set(guildId, timer);
+}
 
-player.events.on('playerStart', (queue, track) => {
-    // Si la música empieza o se reanuda, cancelamos cualquier timer de desconexión
-    if (disconnectTimers.has(queue.guild.id)) {
-        clearTimeout(disconnectTimers.get(queue.guild.id));
-        disconnectTimers.delete(queue.guild.id);
+function clearInactivityTimer(guildId) {
+    if (disconnectTimers.has(guildId)) {
+        clearTimeout(disconnectTimers.get(guildId));
+        disconnectTimers.delete(guildId);
     }
-    queue.metadata.channel.send(`🎶 Reproduciendo ahora: **${track.title}**`);
-});
+}
 
-// Definición de Comandos (Slash Commands)
+// Búsqueda en la API de Deezer (gratuita, sin API key)
+function searchDeezer(endpoint, query) {
+    return new Promise((resolve, reject) => {
+        const url = `https://api.deezer.com/search/${endpoint}?q=${encodeURIComponent(query)}&limit=10`;
+        https.get(url, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try { resolve(JSON.parse(data)); }
+                catch (e) { resolve({ data: [] }); }
+            });
+        }).on('error', () => resolve({ data: [] }));
+    });
+}
+
+// Reproduce la siguiente canción de la cola
+async function playNext(guildId, textChannel) {
+    const serverQueue = queues.get(guildId);
+    if (!serverQueue || serverQueue.songs.length === 0) {
+        startInactivityTimer(guildId);
+        return;
+    }
+
+    clearInactivityTimer(guildId);
+    const song = serverQueue.songs[0];
+
+    try {
+        const stream = await playdl.stream(song.url);
+        const resource = createAudioResource(stream.stream, {
+            inputType: stream.type
+        });
+
+        serverQueue.player.play(resource);
+        textChannel.send(`🎶 Reproduciendo ahora: **${song.title}**`);
+    } catch (error) {
+        console.error('Error reproduciendo:', error);
+        textChannel.send('❌ Error al reproducir la canción, saltando...');
+        serverQueue.songs.shift();
+        playNext(guildId, textChannel);
+    }
+}
+
+// --- Definición de Comandos ---
 const commands = [
     {
         name: 'playy',
-        description: 'Reproduce una canción o vídeo desde YouTube.',
+        description: 'Reproduce el audio de un vídeo de YouTube.',
         options: [
             {
                 name: 'url',
-                type: 3, // STRING type
-                description: 'El enlace de YouTube',
+                type: 3,
+                description: 'El enlace de YouTube (youtube.com o youtu.be)',
                 required: true,
             },
         ],
     },
     {
         name: 'plays',
-        description: 'Reproduce una canción desde Spotify.',
+        description: 'Busca y reproduce una canción por artista y título.',
         options: [
             {
                 name: 'artista',
@@ -98,15 +119,24 @@ const commands = [
         ],
     },
     {
+        name: 'skip',
+        description: 'Salta la canción actual.',
+    },
+    {
+        name: 'stop',
+        description: 'Detiene la reproducción y vacía la cola.',
+    },
+    {
         name: 'help',
         description: 'Muestra la ayuda y comandos del bot Jester.',
     }
 ];
 
+// --- Registro de comandos al iniciar ---
 client.once('ready', async () => {
     console.log(`🤖 ¡Jester está en línea como ${client.user.tag}!`);
     console.log('🔄 Registrando comandos globales...');
-    
+
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     try {
         await rest.put(
@@ -119,46 +149,96 @@ client.once('ready', async () => {
     }
 });
 
+// --- Handler principal ---
 client.on('interactionCreate', async (interaction) => {
+
+    // ==================== AUTOCOMPLETADO ====================
     if (interaction.isAutocomplete()) {
-        const commandName = interaction.commandName;
-        
-        if (commandName === 'plays') {
-            const focusedValue = interaction.options.getFocused();
-            if (!focusedValue) return await interaction.respond([]);
+        if (interaction.commandName !== 'plays') return;
 
-            try {
-                // Buscamos en YouTube o YT Music usando play-dl para sugerencias rápidas
-                const results = await playdl.search(focusedValue, { limit: 15, source: { youtube: 'video' } });
-                
-                // Filtramos y mapeamos resultados para Discord (máximo 25 opciones, max 100 caracteres por nombre)
-                const choices = results.map(video => {
-                    // Truncamos el título si es muy largo
-                    const title = video.title.length > 95 ? video.title.substring(0, 95) + '...' : video.title;
-                    return {
-                        name: title,
-                        value: title 
-                    };
-                }).slice(0, 10); // Mostramos solo los 10 mejores para no saturar
+        const focusedOption = interaction.options.getFocused(true);
+        const focusedValue = focusedOption.value;
 
+        if (!focusedValue || focusedValue.length < 1) {
+            return await interaction.respond([]);
+        }
+
+        try {
+            if (focusedOption.name === 'artista') {
+                // SOLO artistas
+                const result = await searchDeezer('artist', focusedValue);
+                const choices = (result.data || []).map(artist => ({
+                    name: artist.name.length > 95 ? artist.name.substring(0, 95) + '...' : artist.name,
+                    value: artist.name
+                })).slice(0, 10);
                 await interaction.respond(choices);
-            } catch (error) {
-                console.error("Autocomplete error:", error);
-                await interaction.respond([]);
+
+            } else if (focusedOption.name === 'cancion') {
+                // Canciones SOLO del artista seleccionado
+                const artista = interaction.options.getString('artista') || '';
+                const searchQuery = artista
+                    ? `${artista} ${focusedValue}`
+                    : focusedValue;
+
+                const result = await searchDeezer('track', searchQuery);
+                // Filtramos: solo canciones cuyo artista coincida (case-insensitive)
+                const filtered = (result.data || []).filter(track =>
+                    artista ? track.artist.name.toLowerCase().includes(artista.toLowerCase()) : true
+                );
+
+                const choices = filtered.map(track => {
+                    const label = `${track.title}`;
+                    return {
+                        name: label.length > 95 ? label.substring(0, 95) + '...' : label,
+                        value: track.title
+                    };
+                }).slice(0, 10);
+                await interaction.respond(choices);
             }
+        } catch (error) {
+            console.error('Autocomplete error:', error);
+            await interaction.respond([]);
         }
         return;
     }
 
+    // ==================== COMANDOS ====================
     if (!interaction.isChatInputCommand()) return;
 
+    // /help
     if (interaction.commandName === 'help') {
         return interaction.reply({
-            content: `🎭 **¡Hola! Soy Jester, tu bufón musical.**\n\nMis comandos actuales:\n- \`/playy <url>\`: Reproduce una canción directamente desde un enlace de YouTube.\n- \`/plays <artista> <cancion>\`: Busca y reproduce una canción (ahora con autocompletado en vivo).\n- \`/help\`: Muestra este mensaje de ayuda.\n\n🎵 *Si me quedo solo o sin música durante 30 minutos, me iré a descansar.*`,
+            content: `🎭 **¡Hola! Soy Jester, tu bufón musical.**\n\nMis comandos:\n- \`/playy <url>\`: Reproduce el audio de un enlace de YouTube.\n- \`/plays <artista> <cancion>\`: Busca una canción con autocompletado inteligente.\n- \`/skip\`: Salta la canción actual.\n- \`/stop\`: Detiene la música y vacía la cola.\n- \`/help\`: Muestra este mensaje.\n\n🎵 *Si me quedo solo o sin música durante 30 minutos, me iré a descansar.*`,
             ephemeral: true
         });
     }
 
+    // /skip
+    if (interaction.commandName === 'skip') {
+        const serverQueue = queues.get(interaction.guild.id);
+        if (!serverQueue || serverQueue.songs.length === 0) {
+            return interaction.reply({ content: '❌ No hay nada reproduciéndose.', ephemeral: true });
+        }
+        serverQueue.songs.shift();
+        serverQueue.player.stop();
+        return interaction.reply('⏭️ Canción saltada.');
+    }
+
+    // /stop
+    if (interaction.commandName === 'stop') {
+        const serverQueue = queues.get(interaction.guild.id);
+        if (!serverQueue) {
+            return interaction.reply({ content: '❌ No hay nada reproduciéndose.', ephemeral: true });
+        }
+        serverQueue.songs = [];
+        serverQueue.player.stop();
+        serverQueue.connection.destroy();
+        queues.delete(interaction.guild.id);
+        clearInactivityTimer(interaction.guild.id);
+        return interaction.reply('⏹️ Música detenida y cola vaciada.');
+    }
+
+    // /playy y /plays
     if (interaction.commandName === 'playy' || interaction.commandName === 'plays') {
         const voiceChannel = interaction.member.voice.channel;
         if (!voiceChannel) {
@@ -172,68 +252,98 @@ client.on('interactionCreate', async (interaction) => {
 
         await interaction.deferReply();
 
-        let queryUrl = '';
-        if (interaction.commandName === 'playy') {
-            queryUrl = interaction.options.getString('url');
-        } else if (interaction.commandName === 'plays') {
-            const artista = interaction.options.getString('artista');
-            const cancion = interaction.options.getString('cancion');
-            const searchString = `${artista} ${cancion}`;
-            
-            // Usamos play-dl como puente robusto para encontrar el link de YouTube de la canción
-            try {
-                const ytResults = await playdl.search(searchString, { limit: 1, source: { youtube: 'video' } });
-                if (ytResults && ytResults.length > 0) {
-                    queryUrl = ytResults[0].url;
-                } else {
-                    return interaction.followUp('❌ No se encontró el audio para esa canción.');
-                }
-            } catch(e) {
-                console.error(e);
-                return interaction.followUp('❌ Hubo un error buscando en el catálogo musical.');
-            }
-        }
-        
+        let videoUrl = '';
+        let videoTitle = '';
+
         try {
-            // Buscamos con discord-player usando la URL de youtube obtenida (o dada por el user en playy)
-            const searchResult = await player.search(queryUrl, {
-                searchEngine: QueryType.YOUTUBE_VIDEO,
-                requestedBy: interaction.user
-            });
+            if (interaction.commandName === 'playy') {
+                // YouTube: el usuario pasa directamente un enlace
+                videoUrl = interaction.options.getString('url');
 
-            if (!searchResult || !searchResult.tracks.length) {
-                return interaction.followUp('❌ No se encontró ninguna canción o el enlace es inválido.');
+                // Validamos que sea un enlace de YouTube
+                if (!playdl.yt_validate(videoUrl)) {
+                    return interaction.followUp('❌ Eso no parece ser un enlace válido de YouTube. Usa un enlace como `https://www.youtube.com/watch?v=...` o `https://youtu.be/...`');
+                }
+
+                // Obtenemos el título del vídeo
+                const info = await playdl.video_basic_info(videoUrl);
+                videoTitle = info.video_details.title;
+
+            } else if (interaction.commandName === 'plays') {
+                // Spotify/Artista: buscamos en YouTube la canción del artista
+                const artista = interaction.options.getString('artista');
+                const cancion = interaction.options.getString('cancion');
+                const searchString = `${artista} - ${cancion}`;
+
+                const results = await playdl.search(searchString, { limit: 1, source: { youtube: 'video' } });
+                if (!results || results.length === 0) {
+                    return interaction.followUp('❌ No se encontró ninguna canción con ese nombre y artista.');
+                }
+
+                videoUrl = results[0].url;
+                videoTitle = results[0].title;
             }
-
-            const queue = await player.nodes.create(interaction.guild, {
-                metadata: {
-                    channel: interaction.channel,
-                    client: interaction.guild.members.me,
-                    requestedBy: interaction.user
-                },
-                selfDeaf: true,
-                volume: 80,
-                leaveOnEmpty: false,
-                leaveOnEnd: false,
-            });
-
-            if (!queue.connection) {
-                await queue.connect(voiceChannel);
-            }
-
-            queue.addTrack(searchResult.tracks[0]);
-            
-            if (!queue.node.isPlaying()) {
-                await queue.node.play();
-                interaction.followUp(`⏳ Añadido a la cola y cargando: **${searchResult.tracks[0].title}**...`);
-            } else {
-                interaction.followUp(`✅ Añadido a la cola: **${searchResult.tracks[0].title}**`);
-            }
-
         } catch (error) {
-            console.error(error);
-            interaction.followUp('❌ Hubo un error al intentar reproducir la canción.');
+            console.error('Error buscando:', error);
+            return interaction.followUp('❌ Hubo un error buscando la canción.');
         }
+
+        // Añadir a la cola y reproducir
+        const song = { url: videoUrl, title: videoTitle };
+        const serverQueue = queues.get(interaction.guild.id);
+
+        if (serverQueue) {
+            // Ya hay una cola activa, añadimos la canción
+            serverQueue.songs.push(song);
+            return interaction.followUp(`✅ Añadido a la cola: **${videoTitle}**`);
+        }
+
+        // Crear nueva cola y conectar al canal de voz
+        const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId: interaction.guild.id,
+            adapterCreator: interaction.guild.voiceAdapterCreator,
+            selfDeaf: true,
+        });
+
+        const player = createAudioPlayer();
+        const newQueue = {
+            connection,
+            player,
+            songs: [song],
+            textChannel: interaction.channel,
+        };
+
+        queues.set(interaction.guild.id, newQueue);
+        connection.subscribe(player);
+
+        // Cuando termina una canción, reproducir la siguiente
+        player.on(AudioPlayerStatus.Idle, () => {
+            const q = queues.get(interaction.guild.id);
+            if (q) {
+                q.songs.shift();
+                playNext(interaction.guild.id, q.textChannel);
+            }
+        });
+
+        player.on('error', (error) => {
+            console.error('Player error:', error);
+            const q = queues.get(interaction.guild.id);
+            if (q) {
+                q.textChannel.send('❌ Error en la reproducción.');
+                q.songs.shift();
+                playNext(interaction.guild.id, q.textChannel);
+            }
+        });
+
+        // Limpiar cuando se desconecta
+        connection.on(VoiceConnectionStatus.Disconnected, () => {
+            queues.delete(interaction.guild.id);
+            clearInactivityTimer(interaction.guild.id);
+        });
+
+        interaction.followUp(`⏳ Cargando: **${videoTitle}**...`);
+        playNext(interaction.guild.id, interaction.channel);
     }
 });
 
