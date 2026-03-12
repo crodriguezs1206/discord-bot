@@ -181,4 +181,17 @@ client.on('interactionCreate', async (interaction) => {
     }
 });
 
+// Servidor web auxiliar para mantener el bot activo 24/7 en Render con UptimeRobot
+const express = require('express');
+const app = express();
+const port = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+    res.send('Jester Bot is alive!');
+});
+
+app.listen(port, () => {
+    console.log(`🌐 Servidor web escuchando en el puerto ${port}`);
+});
+
 client.login(process.env.DISCORD_TOKEN);
