@@ -3,22 +3,86 @@ const { Client, GatewayIntentBits, Collection, REST, Routes } = require('discord
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, StreamType } = require('@discordjs/voice');
 const playdl = require('play-dl');
 const https = require('https');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 
-// Detectar ffmpeg: sistema primero, luego npm
-let FFMPEG_PATH = 'ffmpeg'; // sistema (instalado via apt en Docker)
+// Detectar ffmpeg: npm primero (siempre presente), luego sistema
+let FFMPEG_PATH = 'ffmpeg';
 try {
     const ffmpegStatic = require('ffmpeg-static');
     if (ffmpegStatic) FFMPEG_PATH = ffmpegStatic;
 } catch (e) { /* usar sistema */ }
 
-// Detectar yt-dlp: sistema primero, luego npm
+// yt-dlp path (se configura en ensureYtDlp)
 let YT_DLP_PATH = 'yt-dlp';
-try {
-    const bundled = require('youtube-dl-exec');
-    if (bundled && bundled.raw) YT_DLP_PATH = bundled.raw;
-} catch (e) { /* usar sistema */ }
+
+// Comprobar si un binario existe en el sistema
+function binaryExists(name) {
+    try {
+        execSync(`which ${name}`, { stdio: 'ignore' });
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// Descargar yt-dlp automáticamente si no está disponible
+async function ensureYtDlp() {
+    // 1. Intentar sistema
+    if (binaryExists('yt-dlp')) {
+        YT_DLP_PATH = 'yt-dlp';
+        console.log('✅ yt-dlp encontrado en el sistema');
+        return;
+    }
+
+    // 2. Intentar binario del npm (youtube-dl-exec)
+    try {
+        const bundled = require('youtube-dl-exec');
+        if (bundled && bundled.raw && fs.existsSync(bundled.raw)) {
+            YT_DLP_PATH = bundled.raw;
+            console.log(`✅ yt-dlp encontrado via npm: ${YT_DLP_PATH}`);
+            return;
+        }
+    } catch (e) { /* no disponible */ }
+
+    // 3. Descargar binario de GitHub
+    const localPath = path.join(__dirname, 'yt-dlp');
+    if (fs.existsSync(localPath)) {
+        YT_DLP_PATH = localPath;
+        console.log(`✅ yt-dlp encontrado localmente: ${localPath}`);
+        return;
+    }
+
+    console.log('⬇️ Descargando yt-dlp desde GitHub...');
+    const downloadUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+
+    await new Promise((resolve, reject) => {
+        function download(url) {
+            https.get(url, (res) => {
+                // Seguir redirects
+                if (res.statusCode === 302 || res.statusCode === 301) {
+                    return download(res.headers.location);
+                }
+                if (res.statusCode !== 200) {
+                    return reject(new Error(`HTTP ${res.statusCode} descargando yt-dlp`));
+                }
+                const file = fs.createWriteStream(localPath);
+                res.pipe(file);
+                file.on('finish', () => {
+                    file.close();
+                    // Hacer ejecutable
+                    fs.chmodSync(localPath, '755');
+                    console.log('✅ yt-dlp descargado correctamente');
+                    resolve();
+                });
+            }).on('error', reject);
+        }
+        download(downloadUrl);
+    });
+
+    YT_DLP_PATH = localPath;
+}
 
 // Opciones base de yt-dlp optimizadas para servidores cloud
 const YT_DLP_BASE_ARGS = [
@@ -219,26 +283,15 @@ const commands = [
 
 // --- Bot Ready ---
 client.once('ready', async () => {
-    console.log(`🤖 ¡Jester está en línea como ${client.user.tag}!`);
-    console.log(`🔧 yt-dlp: ${YT_DLP_PATH}`);
-    console.log(`🔧 ffmpeg: ${FFMPEG_PATH}`);
-
-    // Test yt-dlp al arrancar
-    try {
-        const proc = spawn(YT_DLP_PATH, ['--version']);
-        let ver = '';
-        proc.stdout.on('data', d => ver += d);
-        proc.on('close', () => console.log(`🔧 yt-dlp version: ${ver.trim()}`));
-    } catch (e) {
-        console.error('⚠️ yt-dlp no disponible:', e.message);
-    }
+    console.log(`\u{1F916} ¡Jester está en línea como ${client.user.tag}!`);
+    console.log(`\u{1F527} ffmpeg: ${FFMPEG_PATH}`);
 
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     try {
         await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-        console.log('✅ Comandos registrados con éxito.');
+        console.log('\u2705 Comandos registrados con éxito.');
     } catch (error) {
-        console.error('❌ Error registrando comandos:', error);
+        console.error('\u274C Error registrando comandos:', error);
     }
 });
 
@@ -426,6 +479,16 @@ const express = require('express');
 const app = express();
 const port = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Jester Bot is alive!'));
-app.listen(port, () => console.log(`🌐 Web en puerto ${port}`));
+app.listen(port, () => console.log(`\u{1F310} Web en puerto ${port}`));
 
-client.login(process.env.DISCORD_TOKEN);
+// Iniciar el bot: primero asegurar yt-dlp, luego login
+(async () => {
+    try {
+        await ensureYtDlp();
+        console.log(`\u{1F527} yt-dlp listo: ${YT_DLP_PATH}`);
+        await client.login(process.env.DISCORD_TOKEN);
+    } catch (error) {
+        console.error('\u274C Error fatal al iniciar:', error);
+        process.exit(1);
+    }
+})();
