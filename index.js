@@ -6,8 +6,7 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.GuildMessages
     ]
 });
 
@@ -21,8 +20,10 @@ const player = new Player(client, {
     }
 });
 
+const { DefaultExtractors } = require('@discord-player/extractor');
+
 // Cargamos los extractores por defecto (YouTube, Spotify, SoundCloud, etc.)
-player.extractors.loadDefault();
+player.extractors.loadMulti(DefaultExtractors);
 
 // Inactividad de 30 minutos (1800000 ms)
 const INACTIVITY_TIMEOUT = 1800 * 1000;
