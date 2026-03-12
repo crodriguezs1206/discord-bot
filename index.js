@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, Collection, REST, Routes } = require('discord.js');
-const { Player } = require('discord-player');
+const { Player, QueryType } = require('discord-player');
 
 const client = new Client({
     intents: [
@@ -131,18 +131,18 @@ client.on('interactionCreate', async (interaction) => {
 
         await interaction.deferReply();
 
-        let query = '';
+            let query = '';
         if (interaction.commandName === 'playy') {
             query = interaction.options.getString('url');
         } else if (interaction.commandName === 'plays') {
             const artista = interaction.options.getString('artista');
             const cancion = interaction.options.getString('cancion');
-            query = `${artista} ${cancion} spotify`;
+            query = `${artista} ${cancion}`;
         }
         
         try {
             const searchResult = await player.search(query, {
-                searchEngine: interaction.commandName === 'playy' ? 'youtube' : 'spotify',
+                searchEngine: QueryType.AUTO,
                 requestedBy: interaction.user
             });
 
